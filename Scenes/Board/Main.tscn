@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://1vsc5f8ey52x"]
+
+[ext_resource type="Script" uid="uid://bgusxue6vyybn" path="res://Scenes/Board/chess.gd" id="1_ff6o5"]
+
+[node name="Main" type="Node2D" unique_id=212921874]
+script = ExtResource("1_ff6o5")
