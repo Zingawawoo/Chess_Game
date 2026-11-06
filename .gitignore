@@ -1,3 +1,7 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
+
+# Stockfish binary (large, download separately - see engine/README.md)
+/engine/stockfish*
+/engine/Copying.txt
