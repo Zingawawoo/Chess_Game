@@ -1,8 +1,9 @@
 extends Node2D
 ## Top-down 2D chess using the "Pixel Chess" asset pack by Dani Maccari.
-## Two players on one machine, or play against Stockfish. Click or drag to move.
+## Two players on one machine, over LAN, or against Stockfish. Click or drag to move.
 
 const UciEngine := preload("res://uci_engine.gd")
+const LanNet := preload("res://Utilities/Online/lan_net.gd")
 
 const ASSET := "res://Assets/pixel chess_v1.2/"
 const SQ := 16          # square size in board pixels
@@ -78,6 +79,25 @@ var eval_white_ahead := true
 var captured := {"w": [], "b": []}
 var cap_labels := {}  # colour -> Label showing that side's material lead ("+3")
 
+# LAN multiplayer. While online, this player only moves my_color and moves go to the opponent.
+var lan: LanNet
+var online := false
+var my_color := "w"
+var mp_button: Button
+var mp_panel: PanelContainer
+var mp_name_edit: LineEdit
+var mp_host_btn: Button
+var mp_lobby_list: ItemList
+var mp_lobbies: Array = []
+var mp_join_btn: Button
+var mp_ip_edit: LineEdit
+var mp_status: Label
+var mp_from_menu := false  # lobby panel was opened from the start menu; closing it goes back there
+
+# Start menu shown over the board.
+var menu: Control
+var top_bar: HBoxContainer
+
 var status_label: Label
 var engine_toggle: CheckButton
 var eval_toggle: CheckButton
@@ -89,6 +109,14 @@ func _ready() -> void:
 	tex_white = load(ASSET + "16x16 pieces/WhitePieces.png")
 	tex_black = load(ASSET + "16x16 pieces/BlackPieces.png")
 	_load_cursors()
+	lan = LanNet.new()
+	lan.name = "Lan"
+	add_child(lan)
+	lan.lobbies_changed.connect(_on_lobbies_changed)
+	lan.opponent_joined.connect(_on_opponent_joined)
+	lan.joined_host.connect(func(): mp_status.text = "Connected - starting game...")
+	lan.join_failed.connect(_on_join_failed)
+	lan.opponent_left.connect(func(): _go_offline("Opponent left the game"))
 	_build_ui()
 	get_viewport().size_changed.connect(_layout)
 	_layout()
@@ -100,9 +128,16 @@ func _build_ui() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
 	var bar := HBoxContainer.new()
+	top_bar = bar
 	bar.position = Vector2(12, 12)
 	bar.add_theme_constant_override("separation", 12)
 	layer.add_child(bar)
+
+	var menu_btn := Button.new()
+	menu_btn.text = "Menu"
+	menu_btn.focus_mode = Control.FOCUS_NONE
+	menu_btn.pressed.connect(_show_menu)
+	bar.add_child(menu_btn)
 
 	var swap := Button.new()
 	swap.text = "Swap Colors"
@@ -113,8 +148,14 @@ func _build_ui() -> void:
 	var reset := Button.new()
 	reset.text = "New Game"
 	reset.focus_mode = Control.FOCUS_NONE
-	reset.pressed.connect(new_game)
+	reset.pressed.connect(_on_new_game_pressed)
 	bar.add_child(reset)
+
+	mp_button = Button.new()
+	mp_button.text = "Multiplayer"
+	mp_button.focus_mode = Control.FOCUS_NONE
+	mp_button.pressed.connect(_on_mp_button)
+	bar.add_child(mp_button)
 
 	engine_toggle = CheckButton.new()
 	engine_toggle.text = "Play vs Stockfish"
@@ -162,6 +203,9 @@ func _build_ui() -> void:
 		lead.visible = false
 		layer.add_child(lead)
 		cap_labels[c] = lead
+
+	_build_mp_panel(layer)
+	_build_menu(layer)
 
 
 func _layout() -> void:
@@ -309,6 +353,8 @@ func _draw_captured() -> void:
 # ---------------------------------------------------------------- stockfish
 
 func _human_turn() -> bool:
+	if online:
+		return turn == my_color
 	return not engine_enabled or turn == human_color
 
 
@@ -352,6 +398,9 @@ func _cancel_search() -> void:
 
 
 func _set_engine_enabled(on: bool) -> void:
+	if on and online:
+		engine_toggle.set_pressed_no_signal(false)
+		return
 	if on:
 		var err := _ensure_engine()
 		if err != "":
@@ -692,6 +741,8 @@ func _do_move(m: Dictionary) -> void:
 	promo_pending = {}
 	_update_captured_ui()
 	_update_status()
+	if online and p[0] == my_color:
+		_net_move.rpc(move_list[move_list.size() - 1])
 
 
 func _update_status() -> void:
@@ -709,6 +760,10 @@ func _update_status() -> void:
 		status_label.text = side + " to move" + ("  (check!)" if check else "")
 		if engine_enabled and turn != human_color:
 			status_label.text += "  - Stockfish thinking (depth %d)..." % engine_depth
+		elif online:
+			status_label.text += "  - your move" if turn == my_color else "  - opponent's move"
+	if online:
+		status_label.text = "[Online: you are %s]  " % ("White" if my_color == "w" else "Black") + status_label.text
 
 
 # ---------------------------------------------------------------- coordinates
@@ -906,3 +961,345 @@ func _draw() -> void:
 			draw_rect(r, LIGHT_COL)
 			draw_rect(r.grow(-0.5), BORDER_COL, false, 1.0)
 			_draw_piece(turn + PROMO_CHOICES[i], r)
+
+
+# ---------------------------------------------------------------- LAN multiplayer
+
+func _build_mp_panel(layer: CanvasLayer) -> void:
+	mp_panel = PanelContainer.new()
+	mp_panel.visible = false
+	mp_panel.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	var style := StyleBoxFlat.new()
+	style.bg_color = BAR_BLACK
+	style.border_color = BORDER_COL
+	style.set_border_width_all(3)
+	style.set_corner_radius_all(4)
+	mp_panel.add_theme_stylebox_override("panel", style)
+	layer.add_child(mp_panel)
+
+	var margin := MarginContainer.new()
+	for side in ["left", "right", "top", "bottom"]:
+		margin.add_theme_constant_override("margin_" + side, 16)
+	mp_panel.add_child(margin)
+	var box := VBoxContainer.new()
+	box.custom_minimum_size = Vector2(520, 0)
+	box.add_theme_constant_override("separation", 10)
+	margin.add_child(box)
+
+	var title := Label.new()
+	title.text = "LAN Multiplayer"
+	title.add_theme_font_size_override("font_size", 24)
+	box.add_child(title)
+
+	var host_row := HBoxContainer.new()
+	box.add_child(host_row)
+	mp_name_edit = LineEdit.new()
+	mp_name_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var user := OS.get_environment("USERNAME")
+	if user == "":
+		user = OS.get_environment("USER")
+	mp_name_edit.text = (user + "'s game") if user != "" else "Chess game"
+	mp_name_edit.placeholder_text = "Game name"
+	host_row.add_child(mp_name_edit)
+	mp_host_btn = Button.new()
+	mp_host_btn.text = "Host"
+	mp_host_btn.pressed.connect(_on_host_pressed)
+	host_row.add_child(mp_host_btn)
+
+	var found := Label.new()
+	found.text = "Games on your network:"
+	box.add_child(found)
+	mp_lobby_list = ItemList.new()
+	mp_lobby_list.custom_minimum_size = Vector2(0, 180)
+	mp_lobby_list.item_activated.connect(func(_i: int): _on_join_selected())
+	mp_lobby_list.item_selected.connect(func(_i: int): mp_join_btn.disabled = false)
+	box.add_child(mp_lobby_list)
+
+	var join_row := HBoxContainer.new()
+	box.add_child(join_row)
+	mp_join_btn = Button.new()
+	mp_join_btn.text = "Join selected"
+	mp_join_btn.disabled = true
+	mp_join_btn.pressed.connect(_on_join_selected)
+	join_row.add_child(mp_join_btn)
+	mp_ip_edit = LineEdit.new()
+	mp_ip_edit.placeholder_text = "or type an IP address"
+	mp_ip_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	mp_ip_edit.text_submitted.connect(func(_t: String): _on_join_ip())
+	join_row.add_child(mp_ip_edit)
+	var join_ip := Button.new()
+	join_ip.text = "Join IP"
+	join_ip.pressed.connect(_on_join_ip)
+	join_row.add_child(join_ip)
+
+	mp_status = Label.new()
+	mp_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(mp_status)
+
+	var bottom := HBoxContainer.new()
+	bottom.alignment = BoxContainer.ALIGNMENT_END
+	box.add_child(bottom)
+	var close := Button.new()
+	close.text = "Close"
+	close.pressed.connect(_close_mp_panel)
+	bottom.add_child(close)
+
+
+## Multiplayer button: opens the lobby panel, or leaves the online game.
+func _on_mp_button() -> void:
+	if online:
+		_go_offline("You left the online game")
+		return
+	if mp_panel.visible:
+		_close_mp_panel()
+		return
+	mp_panel.visible = true
+	mp_panel.reset_size()
+	mp_panel.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	if not lan.hosting:
+		mp_status.text = ""
+		var err := lan.start_browsing()
+		if err != "":
+			mp_status.text = err
+	_refresh_lobby_list()
+
+
+## Closing the panel while hosting cancels the hosted game.
+func _close_mp_panel() -> void:
+	mp_panel.visible = false
+	if mp_from_menu and not online:
+		mp_from_menu = false
+		_show_menu()
+	lan.stop_browsing()
+	if lan.hosting and not online:
+		lan.leave()
+	mp_host_btn.disabled = false
+	mp_host_btn.text = "Host"
+
+
+func _on_host_pressed() -> void:
+	if lan.hosting:  # button reads "Cancel" while waiting
+		lan.leave()
+		mp_host_btn.text = "Host"
+		mp_status.text = "Stopped hosting"
+		lan.start_browsing()
+		return
+	lan.stop_browsing()
+	var err := lan.host(mp_name_edit.text.strip_edges())
+	if err != "":
+		mp_status.text = err
+		lan.start_browsing()
+		return
+	mp_host_btn.text = "Cancel"
+	mp_lobby_list.clear()
+	mp_join_btn.disabled = true
+	mp_status.text = "Hosting \"%s\" - waiting for an opponent...\nOthers can also join with your IP: %s" \
+			% [mp_name_edit.text.strip_edges(), LanNet.local_ip()]
+
+
+func _on_lobbies_changed(lobbies: Array) -> void:
+	mp_lobbies = lobbies
+	_refresh_lobby_list()
+
+
+func _refresh_lobby_list() -> void:
+	if mp_lobby_list == null:
+		return
+	mp_lobby_list.clear()
+	for l in mp_lobbies:
+		mp_lobby_list.add_item("%s   (%s)" % [l["name"], l["ip"]])
+	mp_join_btn.disabled = mp_lobby_list.get_selected_items().is_empty()
+	if mp_lobbies.is_empty() and lan.browsing:
+		mp_lobby_list.add_item("Searching...", null, false)
+
+
+func _on_join_selected() -> void:
+	var sel := mp_lobby_list.get_selected_items()
+	if sel.is_empty() or sel[0] >= mp_lobbies.size():
+		return
+	_join(mp_lobbies[sel[0]]["ip"])
+
+
+func _on_join_ip() -> void:
+	var ip := mp_ip_edit.text.strip_edges()
+	if ip.is_valid_ip_address():
+		_join(ip)
+	else:
+		mp_status.text = "That isn't a valid IP address"
+
+
+func _join(ip: String) -> void:
+	lan.stop_browsing()
+	var err := lan.join(ip)
+	if err != "":
+		mp_status.text = err
+		lan.start_browsing()
+		return
+	mp_host_btn.disabled = true
+	mp_status.text = "Connecting to %s..." % ip
+
+
+func _on_join_failed() -> void:
+	mp_host_btn.disabled = false
+	mp_status.text = "Couldn't connect. Check the IP and that the host's firewall allows the game."
+	lan.start_browsing()
+
+
+## Host side: the host keeps the side currently at the bottom of their board.
+func _on_opponent_joined(peer_id: int) -> void:
+	var host_color := "b" if flipped else "w"
+	_go_online(host_color)
+	_net_start.rpc_id(peer_id, _opp(host_color))
+
+
+@rpc("authority", "call_remote", "reliable")
+func _net_start(color: String) -> void:
+	_go_online(color)
+
+
+func _go_online(color: String) -> void:
+	online = true
+	mp_from_menu = false
+	my_color = color
+	if engine_enabled:
+		engine_enabled = false
+		_cancel_search()
+	engine_toggle.set_pressed_no_signal(false)
+	engine_toggle.disabled = true
+	flipped = color == "b"
+	mp_panel.visible = false
+	lan.stop_browsing()
+	mp_host_btn.disabled = false
+	mp_host_btn.text = "Host"
+	mp_button.text = "Leave Online"
+	new_game()
+
+
+func _go_offline(reason: String) -> void:
+	var was_online := online
+	online = false
+	lan.leave()
+	engine_toggle.disabled = false
+	mp_button.text = "Multiplayer"
+	mp_host_btn.disabled = false
+	mp_host_btn.text = "Host"
+	if mp_panel.visible:
+		mp_status.text = reason
+		lan.start_browsing()
+	_clear_selection()
+	_update_status()
+	if was_online:
+		status_label.text = reason + "  -  " + status_label.text
+	queue_redraw()
+	_update_cursor()
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _net_move(uci: String) -> void:
+	if not online or turn == my_color or game_over:
+		return
+	var fr := _name_to_sq(uci.substr(0, 2))
+	var to := _name_to_sq(uci.substr(2, 2))
+	var promo := uci.substr(4, 1).to_upper()
+	for m in _legal_from(fr):
+		if m["to"] == to and m.get("promo", "") == promo:
+			_clear_selection()
+			_do_move(m)
+			queue_redraw()
+			_update_cursor()
+			return
+	push_warning("Opponent sent a move this board considers illegal: " + uci)
+	status_label.text = "Out of sync with opponent (got %s) - press New Game" % uci
+
+
+func _on_new_game_pressed() -> void:
+	if online:
+		_net_new_game.rpc()
+	new_game()
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _net_new_game() -> void:
+	if online:
+		new_game()
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		if lan != null and lan.is_inside_tree():
+			lan.leave()
+
+
+# ---------------------------------------------------------------- start menu
+
+func _build_menu(layer: CanvasLayer) -> void:
+	menu = ColorRect.new()
+	(menu as ColorRect).color = Color8(36, 40, 52)
+	menu.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	menu.mouse_filter = Control.MOUSE_FILTER_STOP
+	layer.add_child(menu)
+
+	var box := VBoxContainer.new()
+	box.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	box.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	box.grow_vertical = Control.GROW_DIRECTION_BOTH
+	box.custom_minimum_size = Vector2(360, 0)
+	box.add_theme_constant_override("separation", 16)
+	menu.add_child(box)
+
+	var title := Label.new()
+	title.text = "Pixel Chess"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 64)
+	title.add_theme_color_override("font_color", LIGHT_COL)
+	box.add_child(title)
+
+	var spacer := Control.new()
+	spacer.custom_minimum_size = Vector2(0, 24)
+	box.add_child(spacer)
+
+	for item in [["Solo Match", _on_menu_solo], ["Online Match (LAN)", _on_menu_online], ["Quit", _on_menu_quit]]:
+		var b := Button.new()
+		b.text = item[0]
+		b.custom_minimum_size = Vector2(0, 56)
+		b.add_theme_font_size_override("font_size", 24)
+		b.pressed.connect(item[1])
+		box.add_child(b)
+
+	_show_menu()
+
+
+func _show_menu() -> void:
+	if online:
+		_go_offline("You left the online game")
+	if mp_panel != null and mp_panel.visible:
+		mp_from_menu = false
+		_close_mp_panel()
+	_clear_selection()
+	menu.visible = true
+	top_bar.visible = false
+
+
+func _hide_menu() -> void:
+	menu.visible = false
+	top_bar.visible = true
+
+
+## Solo: local two-player on this machine; Stockfish can be switched on from the top bar.
+func _on_menu_solo() -> void:
+	_hide_menu()
+	new_game()
+
+
+func _on_menu_online() -> void:
+	_hide_menu()
+	new_game()
+	mp_from_menu = true
+	if not mp_panel.visible:
+		_on_mp_button()
+
+
+func _on_menu_quit() -> void:
+	if lan != null:
+		lan.leave()
+	get_tree().quit()
