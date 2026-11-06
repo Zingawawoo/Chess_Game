@@ -20,6 +20,7 @@ var browsing := false
 var lobby_name := ""
 
 var _bcast: PacketPeerUDP
+var _bcast_targets: Array[String] = []  # every LAN's broadcast address, so the right adapter carries it
 var _bcast_timer := 0.0
 var _listen: PacketPeerUDP
 var _lobbies := {}  # "ip:port" -> {name, ip, port, seen}
@@ -45,7 +46,10 @@ func host(game_name: String) -> String:
 	lobby_name = game_name
 	_bcast = PacketPeerUDP.new()
 	_bcast.set_broadcast_enabled(true)
-	_bcast.set_dest_address("255.255.255.255", DISCOVERY_PORT)
+	_bcast_targets = ["255.255.255.255"]
+	for a in local_ips():
+		var parts := a.split(".")
+		_bcast_targets.append("%s.%s.%s.255" % [parts[0], parts[1], parts[2]])
 	_bcast_timer = 0.0
 	return ""
 
@@ -96,16 +100,28 @@ func stop_browsing() -> void:
 	_lobbies.clear()
 
 
-## This machine's LAN address, to show the host so others can type it in.
-static func local_ip() -> String:
-	var fallback := ""
+## This machine's LAN addresses (IPv4, no loopback/link-local), to show the host so others can
+## type one in. Machines often have several (VirtualBox, VPNs), so the real one is listed first.
+static func local_ips() -> Array[String]:
+	var good: Array[String] = []
+	var other: Array[String] = []
 	for a in IP.get_local_addresses():
 		if a.contains(":") or a.begins_with("127.") or a.begins_with("169.254."):
 			continue
-		if a.begins_with("192.168.") or a.begins_with("10.") or a.begins_with("172."):
-			return a
-		fallback = a
-	return fallback if fallback != "" else "127.0.0.1"
+		# 192.168.56.x is VirtualBox's host-only network; 100.x is usually Tailscale.
+		if a.begins_with("192.168.56.") or a.begins_with("100."):
+			other.append(a)
+		elif a.begins_with("192.168.") or a.begins_with("10.") or a.begins_with("172."):
+			good.append(a)
+		else:
+			other.append(a)
+	good.append_array(other)
+	return good
+
+
+static func local_ip() -> String:
+	var ips := local_ips()
+	return ips[0] if not ips.is_empty() else "127.0.0.1"
 
 
 func _stop_broadcast() -> void:
@@ -121,7 +137,10 @@ func _process(delta: float) -> void:
 		if _bcast_timer <= 0.0:
 			_bcast_timer = BROADCAST_EVERY
 			var msg := {"game": GAME_ID, "name": lobby_name, "port": GAME_PORT}
-			_bcast.put_packet(JSON.stringify(msg).to_utf8_buffer())
+			var pkt := JSON.stringify(msg).to_utf8_buffer()
+			for target in _bcast_targets:
+				_bcast.set_dest_address(target, DISCOVERY_PORT)
+				_bcast.put_packet(pkt)
 
 	if not browsing or _listen == null:
 		return

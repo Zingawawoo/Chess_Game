@@ -82,6 +82,19 @@ func think(moves: PackedStringArray, depth: int) -> void:
 	_send("go depth %d" % depth)
 
 
+## Asks the engine about an arbitrary position given as FEN. With `searchmoves`, it only
+## considers those moves at the root (used to keep it to moves the game's powerup rules allow).
+func think_fen(fen: String, depth: int, searchmoves := PackedStringArray()) -> void:
+	if not running or thinking:
+		return
+	thinking = true
+	_send("position fen " + fen)
+	var go := "go depth %d" % depth
+	if not searchmoves.is_empty():
+		go += " searchmoves " + " ".join(searchmoves)
+	_send(go)
+
+
 ## Abandons the current search; its result will not be emitted.
 func cancel() -> void:
 	if thinking and not _discard:
