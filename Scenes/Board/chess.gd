@@ -4,6 +4,7 @@ extends Node2D
 
 const UciEngine := preload("res://uci_engine.gd")
 const LanNet := preload("res://Utilities/Online/lan_net.gd")
+const Strength := preload("res://Utilities/Engine/strength.gd")
 
 const ASSET := "res://Assets/pixel chess_v1.2/"
 const SQ := 16          # square size in board pixels
@@ -61,6 +62,10 @@ var promo_pending: Dictionary = {}
 var engine: UciEngine
 var engine_enabled := false
 var engine_depth := 10
+var skill_level := 20         # Stockfish "Skill Level" for its moves (the eval bar always uses 20)
+var mistake_rate := 0.0       # chance a move is replaced by a random legal one (see Strength)
+var level_option: OptionButton
+var depth_box: SpinBox
 var human_color := "w"
 var move_list := PackedStringArray()  # every move so far in UCI notation, sent to the engine
 var pos_version := 0          # bumps whenever the position changes
@@ -163,19 +168,32 @@ func _build_ui() -> void:
 	engine_toggle.toggled.connect(_set_engine_enabled)
 	bar.add_child(engine_toggle)
 
+	var level_label := Label.new()
+	level_label.text = "Level"
+	bar.add_child(level_label)
+
+	level_option = OptionButton.new()
+	level_option.focus_mode = Control.FOCUS_NONE
+	for n in Strength.names():
+		level_option.add_item(n)
+	level_option.tooltip_text = Strength.tooltip()
+	level_option.item_selected.connect(_apply_level)
+	bar.add_child(level_option)
+
 	var depth_label := Label.new()
 	depth_label.text = "Depth"
 	bar.add_child(depth_label)
 
-	var depth_box := SpinBox.new()
+	depth_box = SpinBox.new()
 	depth_box.min_value = 1
 	depth_box.max_value = 20
 	depth_box.step = 1
 	depth_box.rounded = true
 	depth_box.value = engine_depth
-	depth_box.tooltip_text = "How many plies Stockfish searches ahead. Higher is stronger but slower."
-	depth_box.value_changed.connect(func(v: float): engine_depth = int(v))
+	depth_box.tooltip_text = "How many plies Stockfish searches ahead. Editing it switches Level to Custom."
+	depth_box.value_changed.connect(_on_depth_changed)
 	bar.add_child(depth_box)
+	_apply_level(Strength.DEFAULT)
 
 	eval_toggle = CheckButton.new()
 	eval_toggle.text = "Eval bar"
@@ -452,7 +470,39 @@ func _start_search(depth: int, for_move: bool) -> void:
 	search_for_move = for_move
 	search_turn = turn
 	analyzed_version = pos_version
-	engine.think(move_list, depth)
+	# Only the opponent's own moves are weakened; the eval bar always sees full-strength Stockfish.
+	engine.think(move_list, depth, skill_level if for_move else 20)
+
+
+## Picks a preset from the Level dropdown (see Strength): sets depth, skill and mistake rate.
+func _apply_level(i: int) -> void:
+	level_option.select(i)
+	if i < Strength.CUSTOM:
+		var lv: Dictionary = Strength.LEVELS[i]
+		engine_depth = lv["depth"]
+		skill_level = lv["skill"]
+		mistake_rate = lv["mistakes"]
+		depth_box.set_value_no_signal(engine_depth)
+	else:
+		skill_level = 20
+		mistake_rate = 0.0
+
+
+## Editing the Depth box by hand means "Custom": that depth at full strength, no mistakes.
+func _on_depth_changed(v: float) -> void:
+	engine_depth = int(v)
+	if level_option.selected != Strength.CUSTOM:
+		_apply_level(Strength.CUSTOM)
+
+
+## A beginner-style blunder: any legal move for the side to move.
+func _random_legal_move() -> Dictionary:
+	var all: Array = []
+	for s in 64:
+		var p: String = board[s]
+		if p != "" and p[0] == turn:
+			all.append_array(_legal_from(s))
+	return all[randi() % all.size()]
 
 
 ## Engine scores are from the side to move's point of view; the bar wants White's.
@@ -506,6 +556,11 @@ func _update_eval_label() -> void:
 
 func _on_engine_bestmove(uci: String) -> void:
 	if not search_for_move or not engine_enabled or game_over or turn == human_color:
+		return
+	if randf() < mistake_rate:
+		_do_move(_random_legal_move())
+		queue_redraw()
+		_update_cursor()
 		return
 	var fr := _name_to_sq(uci.substr(0, 2))
 	var to := _name_to_sq(uci.substr(2, 2))
@@ -1258,7 +1313,8 @@ func _build_menu(layer: CanvasLayer) -> void:
 	spacer.custom_minimum_size = Vector2(0, 24)
 	box.add_child(spacer)
 
-	for item in [["Solo Match", _on_menu_solo], ["Online Match (LAN)", _on_menu_online], ["Quit", _on_menu_quit]]:
+	for item in [["Solo Match", _on_menu_solo], ["Online Match (LAN)", _on_menu_online],
+			["Joker Sandbox", _on_menu_jokers], ["Quit", _on_menu_quit]]:
 		var b := Button.new()
 		b.text = item[0]
 		b.custom_minimum_size = Vector2(0, 56)
@@ -1297,6 +1353,15 @@ func _on_menu_online() -> void:
 	mp_from_menu = true
 	if not mp_panel.visible:
 		_on_mp_button()
+
+
+## The Joker Sandbox is its own scene (Scenes/Solo): hotseat or vs-computer play on a board that
+## jokers can rearrange or reshape. It has its own rules engine (Utilities/Jokers/board_model.gd),
+## so this board's state, including any LAN connection, is simply left behind.
+func _on_menu_jokers() -> void:
+	if lan != null:
+		lan.leave()
+	get_tree().change_scene_to_file("res://Scenes/Solo/SoloMatch.tscn")
 
 
 func _on_menu_quit() -> void:

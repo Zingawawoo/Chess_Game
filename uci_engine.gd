@@ -23,6 +23,7 @@ var _thread: Thread
 var _mutex := Mutex.new()
 var _lines: Array[String] = []
 var _discard := false  ## drop the result of the search that is currently stopping
+var _skill := 20       ## Stockfish's "Skill Level" as last sent (20 = full strength, its default)
 
 
 ## Looks for a Stockfish executable: $STOCKFISH_PATH, ./engine/, next to the game, then $PATH.
@@ -63,6 +64,7 @@ func start() -> String:
 	running = true
 	thinking = false
 	_discard = false
+	_skill = 20
 	_thread = Thread.new()
 	_thread.start(_read_loop)
 	_send("uci")
@@ -71,10 +73,14 @@ func start() -> String:
 
 
 ## Asks the engine for a move in the position reached by `moves` (UCI strings) from the start.
-func think(moves: PackedStringArray, depth: int) -> void:
+## `skill` is Stockfish's "Skill Level" (0 = often plays weaker moves on purpose, 20 = full strength).
+func think(moves: PackedStringArray, depth: int, skill := 20) -> void:
 	if not running or thinking:
 		return
 	thinking = true
+	if skill != _skill:
+		_skill = skill
+		_send("setoption name Skill Level value %d" % skill)
 	var cmd := "position startpos"
 	if not moves.is_empty():
 		cmd += " moves " + " ".join(moves)
