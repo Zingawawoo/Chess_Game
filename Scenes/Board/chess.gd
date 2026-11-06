@@ -6,6 +6,7 @@ extends Node2D
 const UciEngine := preload("res://uci_engine.gd")
 const LanNet := preload("res://Utilities/Online/lan_net.gd")
 const Powerups := preload("res://Utilities/Powerups/powerups.gd")
+const StockfishInstaller := preload("res://Utilities/Engine/stockfish_installer.gd")
 
 const ASSET := "res://Assets/pixel chess_v1.2/"
 const SQ := 16          # square size in board pixels
@@ -63,6 +64,8 @@ var promo_pending: Dictionary = {}
 
 # Stockfish opponent. While enabled, the human plays human_color and the engine the other side.
 var engine: UciEngine
+var installer: StockfishInstaller  # downloads the pinned Stockfish on first use
+var engine_started_ms := 0
 var engine_enabled := false
 var engine_depth := 10
 var human_color := "w"
@@ -157,7 +160,7 @@ func _ready() -> void:
 	get_viewport().size_changed.connect(_layout)
 	_layout()
 	new_game()
-	eval_toggle.button_pressed = true  # on by default; reports an error if Stockfish is missing
+	_setup_stockfish()
 
 
 func _build_ui() -> void:
@@ -475,7 +478,45 @@ func _ensure_engine() -> String:
 		engine.evaluation.connect(_on_engine_eval)
 		engine.failed.connect(_on_engine_failed)
 		add_child(engine)
-	return engine.start()
+	if installer != null and installer.busy:
+		return "Stockfish is still downloading - one moment"
+	if StockfishInstaller.installed_path() == "" and StockfishInstaller.is_supported() \
+			and OS.get_environment("STOCKFISH_PATH") == "":
+		_install_stockfish("avx2", false)
+		return "Downloading Stockfish (first time only) - try again in a moment"
+	var was_running := engine.running
+	var err := engine.start()
+	if err == "" and not was_running:
+		engine_started_ms = Time.get_ticks_msec()
+	return err
+
+
+## Makes sure the pinned Stockfish is installed, then switches the eval bar on (the default).
+func _setup_stockfish() -> void:
+	if StockfishInstaller.installed_path() == "" and StockfishInstaller.is_supported() \
+			and OS.get_environment("STOCKFISH_PATH") == "":
+		_install_stockfish("avx2", true)
+	else:
+		eval_toggle.button_pressed = true
+
+
+func _install_stockfish(variant: String, then_enable_eval: bool) -> void:
+	if installer == null:
+		installer = StockfishInstaller.new()
+		add_child(installer)
+		installer.progress.connect(func(f: float):
+			_event("Downloading Stockfish %s (first time only)... %d%%" \
+					% [StockfishInstaller.VERSION.trim_prefix("sf_"), int(f * 100)]))
+	if installer.busy:
+		return
+	for c in installer.finished.get_connections():
+		installer.finished.disconnect(c["callable"])
+	installer.finished.connect(func(ok: bool, msg: String):
+		_event(msg)
+		if ok and then_enable_eval:
+			eval_toggle.button_pressed = true, CONNECT_ONE_SHOT)
+	_event("Downloading Stockfish (first time only)...")
+	installer.install(variant)
 
 
 ## Abandons whatever the engine is searching; the position will be searched again if needed.
@@ -526,6 +567,10 @@ func _set_eval_enabled(on: bool) -> void:
 
 
 func _on_engine_failed(reason: String) -> void:
+	# The fast avx2 build crashes straight away on CPUs without AVX2: fetch the generic build.
+	if StockfishInstaller.installed_variant() == "avx2" and Time.get_ticks_msec() - engine_started_ms < 5000:
+		_install_stockfish("generic", eval_enabled)
+		reason = "This CPU needs the generic Stockfish build - downloading it..."
 	engine_enabled = false
 	eval_enabled = false
 	engine_toggle.set_pressed_no_signal(false)
@@ -1961,7 +2006,7 @@ func _apply_grant(a: Dictionary) -> void:
 	match a["holder"]:
 		"card":
 			cards[side].append({"id": id, "v": a["v"]})
-			where = "a card"
+			where = "as a card"
 		"piece":
 			var q: int = a["sq"]
 			var nf: Dictionary = fx[q].duplicate(true)

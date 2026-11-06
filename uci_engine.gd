@@ -25,7 +25,10 @@ var _lines: Array[String] = []
 var _discard := false  ## drop the result of the search that is currently stopping
 
 
-## Looks for a Stockfish executable: $STOCKFISH_PATH, ./engine/, next to the game, then $PATH.
+const StockfishInstaller := preload("res://Utilities/Engine/stockfish_installer.gd")
+
+## Looks for a Stockfish executable: $STOCKFISH_PATH, the pinned download, ./engine/,
+## next to the game, then $PATH.
 static func find_binary() -> String:
 	var windows := OS.get_name() == "Windows"
 	var exe := "stockfish.exe" if windows else "stockfish"
@@ -34,6 +37,10 @@ static func find_binary() -> String:
 	var from_env := OS.get_environment("STOCKFISH_PATH")
 	if from_env != "":
 		candidates.append(from_env)
+	# The pinned version the game downloads itself (see Utilities/Engine/stockfish_installer.gd).
+	var pinned: String = StockfishInstaller.installed_path()
+	if pinned != "":
+		candidates.append(pinned)
 	candidates.append(ProjectSettings.globalize_path("res://engine/" + exe))
 	candidates.append(exe_dir.path_join("engine").path_join(exe))
 	candidates.append(exe_dir.path_join(exe))

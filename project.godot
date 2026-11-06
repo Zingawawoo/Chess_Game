@@ -24,8 +24,8 @@ window/stretch/aspect="expand"
 
 [gui]
 
-theme/custom_font="res://Assets/UI/Fonts/GenericMobileSystem.ttf"
 theme/default_font_antialiasing=0
+theme/custom_font="res://Assets/UI/Fonts/GenericMobileSystem.ttf"
 
 [physics]
 
