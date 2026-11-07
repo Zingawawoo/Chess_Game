@@ -9,6 +9,7 @@ var io: FileAccess
 var pid := -1
 var ini_path := ""
 var var_count := 0
+var engine_vars0 := 0
 var last_body := ""
 var last_name := "chess"
 var cur_variant := "chess"
@@ -22,7 +23,15 @@ const CARD_DEPTH := 4
 func _initialize() -> void:
 	var args := OS.get_cmdline_user_args()
 	var jobs: Array = JSON.parse_string(FileAccess.get_file_as_string(args[0]))
-	var out := FileAccess.open(args[1], FileAccess.WRITE)
+	# Resume: keep games already in the output file and skip those jobs.
+	var skip := 0
+	if FileAccess.file_exists(args[1]):
+		for line in FileAccess.get_file_as_string(args[1]).split("\n", false):
+			if line.strip_edges().ends_with("}"):
+				skip += 1
+	var out := FileAccess.open(args[1], FileAccess.READ_WRITE if skip > 0 else FileAccess.WRITE)
+	if skip > 0:
+		out.seek_end()
 	var worker := int(args[2])
 	var workers := int(args[3])
 	ini_path = OS.get_user_data_dir().path_join("sim_rules_%d.ini" % worker)
@@ -41,6 +50,9 @@ func _initialize() -> void:
 	var done := 0
 	for i in jobs.size():
 		if i % workers != worker:
+			continue
+		if skip > 0:
+			skip -= 1
 			continue
 		var job: Dictionary = jobs[i]
 		var res := _play(job)
@@ -353,6 +365,14 @@ func _legal_uci() -> PackedStringArray:
 # ------------------------------------------------------------------ one game
 
 func _play(job: Dictionary) -> Dictionary:
+	# Fairy-Stockfish keeps every variant it has loaded, and each new one gets slower to load,
+	# so start a fresh engine once it has collected a lot of them.
+	if var_count - engine_vars0 > 150:
+		_send("quit")
+		OS.kill(pid)
+		_start_engine()
+		engine_vars0 = var_count
+		cur_variant = "chess"
 	rng.seed = int(job["seed"])
 	g.rng.seed = int(job["seed"]) * 7 + 1
 	var depth: int = job["depth"]
