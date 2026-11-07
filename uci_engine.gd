@@ -15,6 +15,7 @@ signal failed(reason: String)
 const EOF_MARK := "<eof>"
 
 var running := false   ## engine process is alive
+var is_fairy := false  ## the binary is Fairy-Stockfish (understands custom rules via set_variant)
 var thinking := false  ## a search is in flight (even one whose result will be discarded)
 
 var _io: FileAccess
@@ -23,6 +24,7 @@ var _thread: Thread
 var _mutex := Mutex.new()
 var _lines: Array[String] = []
 var _discard := false  ## drop the result of the search that is currently stopping
+var _variant := "chess"
 
 
 const StockfishInstaller := preload("res://Utilities/Engine/stockfish_installer.gd")
@@ -64,6 +66,8 @@ func start() -> String:
 		return "Could not launch " + path
 	_io = info["stdio"]
 	_pid = info["pid"]
+	is_fairy = path.get_file().to_lower().contains("fairy")
+	_variant = "chess"
 	_mutex.lock()
 	_lines.clear()
 	_mutex.unlock()
@@ -100,6 +104,18 @@ func think_fen(fen: String, depth: int, searchmoves := PackedStringArray()) -> v
 	if not searchmoves.is_empty():
 		go += " searchmoves " + " ".join(searchmoves)
 	_send(go)
+
+
+## Fairy-Stockfish only: switch rules. path = a variants .ini to (re)load, or "" to keep the
+## loaded files; name = the variant to play ("chess" for normal rules).
+func set_variant(path: String, name: String) -> void:
+	if not running or not is_fairy:
+		return
+	if path != "":
+		_send("setoption name VariantPath value " + path)
+	if name != _variant or path != "":
+		_send("setoption name UCI_Variant value " + name)
+		_variant = name
 
 
 ## Abandons the current search; its result will not be emitted.

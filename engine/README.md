@@ -1,17 +1,24 @@
-# Stockfish
+# Engine (Fairy-Stockfish)
 
-The game downloads its own pinned copy of Stockfish (currently **17.1**) the first
+The game downloads its own pinned copy of **Fairy-Stockfish 14** (`fairy_sf_14`) the first
 time it runs, on Windows and Linux. Nothing to install by hand.
 
-- Version: `VERSION` in `Utilities/Engine/stockfish_installer.gd` (a release tag from
-  https://github.com/official-stockfish/Stockfish/releases). Change it and the new
+Fairy-Stockfish plays normal chess, and also accepts custom rules. Before every search the
+game writes the current powerup rules as a variant (`user://engine/powerchess.ini`):
+- pieces with Knight Hop / Copy Move / Jump / Backstep become custom piece types
+- frozen pieces become immobile
+- walls and holes become squares nothing may move to
+
+Mines, portals, shields, explosions, decoys, extra moves and ranged captures can't be
+expressed in its rules format; the game still only lets it play moves that are legal here.
+
+- Version: `VERSION` in `Utilities/Engine/stockfish_installer.gd`. Change it and the new
   version downloads on the next launch.
-- It is saved in the game's user data folder (`user://engine/`):
+- Saved in the game's user data folder (`user://engine/`):
   - Windows: `%APPDATA%\Godot\app_userdata\Chess\engine\` (exported game: `%APPDATA%\Chess\engine\`)
   - Linux: `~/.local/share/godot/app_userdata/Chess/engine/`
-- It gets the fast AVX2 build first; if that crashes on an older CPU it switches to
-  the generic build automatically.
-- Stockfish is GPL-3.0. Its licence (`Copying.txt`) is saved next to the engine.
+- Gets the fast BMI2 build first; if that crashes on an older CPU it switches to the
+  generic build automatically.
+- Fairy-Stockfish is GPL-3.0: https://github.com/fairy-stockfish/Fairy-Stockfish
 
-Overrides (for development): set `STOCKFISH_PATH` to use a specific binary, or put
-`stockfish` / `stockfish.exe` in this folder (the pinned download is used first).
+Override (for development): set `STOCKFISH_PATH` to use a specific binary.

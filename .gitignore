@@ -5,3 +5,6 @@
 # Stockfish binary (large, download separately - see engine/README.md)
 /engine/stockfish*
 /engine/Copying.txt
+
+# Self-play simulation raw output (large, regenerate with run_sim.ps1)
+/Utilities/Simulation/data/

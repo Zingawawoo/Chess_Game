@@ -482,12 +482,14 @@ func _ensure_engine() -> String:
 		return "Stockfish is still downloading - one moment"
 	if StockfishInstaller.installed_path() == "" and StockfishInstaller.is_supported() \
 			and OS.get_environment("STOCKFISH_PATH") == "":
-		_install_stockfish("avx2", false)
-		return "Downloading Stockfish (first time only) - try again in a moment"
+		_install_stockfish("fast", false)
+		return "Downloading Fairy-Stockfish (first time only) - try again in a moment"
 	var was_running := engine.running
 	var err := engine.start()
 	if err == "" and not was_running:
 		engine_started_ms = Time.get_ticks_msec()
+		fsf_last_body = ""  # a fresh engine process has none of our rule files loaded
+		fsf_last_name = "chess"
 	return err
 
 
@@ -495,7 +497,7 @@ func _ensure_engine() -> String:
 func _setup_stockfish() -> void:
 	if StockfishInstaller.installed_path() == "" and StockfishInstaller.is_supported() \
 			and OS.get_environment("STOCKFISH_PATH") == "":
-		_install_stockfish("avx2", true)
+		_install_stockfish("fast", true)
 	else:
 		eval_toggle.button_pressed = true
 
@@ -505,8 +507,8 @@ func _install_stockfish(variant: String, then_enable_eval: bool) -> void:
 		installer = StockfishInstaller.new()
 		add_child(installer)
 		installer.progress.connect(func(f: float):
-			_event("Downloading Stockfish %s (first time only)... %d%%" \
-					% [StockfishInstaller.VERSION.trim_prefix("sf_"), int(f * 100)]))
+			_event("Downloading Fairy-Stockfish %s (first time only)... %d%%" \
+					% [StockfishInstaller.VERSION.trim_prefix("fairy_sf_"), int(f * 100)]))
 	if installer.busy:
 		return
 	for c in installer.finished.get_connections():
@@ -515,7 +517,7 @@ func _install_stockfish(variant: String, then_enable_eval: bool) -> void:
 		_event(msg)
 		if ok and then_enable_eval:
 			eval_toggle.button_pressed = true, CONNECT_ONE_SHOT)
-	_event("Downloading Stockfish (first time only)...")
+	_event("Downloading Fairy-Stockfish (first time only)...")
 	installer.install(variant)
 
 
@@ -567,10 +569,10 @@ func _set_eval_enabled(on: bool) -> void:
 
 
 func _on_engine_failed(reason: String) -> void:
-	# The fast avx2 build crashes straight away on CPUs without AVX2: fetch the generic build.
-	if StockfishInstaller.installed_variant() == "avx2" and Time.get_ticks_msec() - engine_started_ms < 5000:
+	# The fast (BMI2) build crashes straight away on old CPUs: fetch the generic build.
+	if StockfishInstaller.installed_variant() == "fast" and Time.get_ticks_msec() - engine_started_ms < 5000:
 		_install_stockfish("generic", eval_enabled)
-		reason = "This CPU needs the generic Stockfish build - downloading it..."
+		reason = "This CPU needs the generic Fairy-Stockfish build - downloading it..."
 	engine_enabled = false
 	eval_enabled = false
 	engine_toggle.set_pressed_no_signal(false)
@@ -599,7 +601,7 @@ func _start_search(depth: int, purpose: String) -> void:
 			_show_eval(eval_target, "?", eval_white_ahead)
 		return
 	var moves := _uci_moves() if purpose != "eval" else PackedStringArray()
-	engine.think_fen(_fen(), depth, moves)
+	engine.think_fen(_fsf_prepare(), depth, moves)
 
 
 func _on_engine_eval(depth: int, cp: int, mate: int) -> void:
@@ -1106,6 +1108,7 @@ func _apply(st: Dictionary, m: Dictionary) -> Dictionary:
 				f[to] = _without(f[to], "ab")
 		# Landing on a special square.
 		if sf[to].has("mine"):
+			var blast: int = int(sf[to]["mine"].get("blast", 0))
 			sf[to] = _without(sf[to], "mine")
 			if p[1] != "K":
 				taken.append({"p": b[to], "fx": f[to], "sq": to})
@@ -1113,6 +1116,12 @@ func _apply(st: Dictionary, m: Dictionary) -> Dictionary:
 				f[to] = {}
 				cur = -1
 				notes.append("hit a mine")
+			for q in 64:
+				if blast > 0 and q != to and b[q] != "" and b[q][1] != "K" \
+						and maxi(absi((q & 7) - (to & 7)), absi((q >> 3) - (to >> 3))) <= blast:
+					taken.append({"p": b[q], "fx": f[q], "sq": q})
+					b[q] = ""
+					f[q] = {}
 		if cur != -1 and sf[cur].has("portal"):
 			var dest: int = sf[cur]["portal"]["pair"]
 			if b[dest] == "" and _pawn_ok(b[cur], dest):
@@ -1139,10 +1148,32 @@ func _apply(st: Dictionary, m: Dictionary) -> Dictionary:
 		var t: Dictionary = taken[i]
 		var tab: Dictionary = t["fx"].get("ab", {})
 		if tab.get("id", "") == "explode":
-			var rad: int = tab["v"]["radius"]
+			var tv: Dictionary = tab["v"]
+			var rad: int = int(tv.get("radius", 1))
 			var cf: int = t["sq"] & 7
 			var cr: int = t["sq"] >> 3
+			# The first piece taken by a normal or ranged capture may survive its own explosion:
+			# then the attacker is destroyed instead and the piece stays where it was.
+			var lives: bool = tv.get("survive", false) or int(tv.get("uses", 1)) > 1
+			var sq0: int = t["sq"]
+			if lives and i == 0 and cur != -1 and b[cur] != "" and b[cur][1] != "K" \
+					and (cur == sq0 or b[sq0] == ""):
+				taken.append({"p": b[cur], "fx": f[cur], "sq": cur})
+				b[cur] = ""
+				f[cur] = {}
+				cur = -1
+				var nf: Dictionary = t["fx"].duplicate(true)
+				var nv: Dictionary = nf["ab"]["v"]
+				nv["uses"] = int(nv.get("uses", 1)) - 1
+				if nv["uses"] <= 0 or nv.get("survive", false):
+					nf.erase("ab")
+				b[sq0] = t["p"]
+				f[sq0] = nf
+				t["survived"] = true
+				notes.append("survived its own explosion")
 			for q in 64:
+				if q == sq0 and t.get("survived", false):
+					continue
 				if b[q] != "" and b[q][1] != "K" and maxi(absi((q & 7) - cf), absi((q >> 3) - cr)) <= rad:
 					taken.append({"p": b[q], "fx": f[q], "sq": q})
 					if q == cur:
@@ -1151,6 +1182,11 @@ func _apply(st: Dictionary, m: Dictionary) -> Dictionary:
 					f[q] = {}
 			notes.append("set off an explosion")
 		i += 1
+	var kept: Array = []
+	for t in taken:
+		if not t.get("survived", false):
+			kept.append(t)
+	taken = kept
 	# Use up the ability.
 	var used: String = m.get("ab", "")
 	if used != "" and cur != -1:
@@ -1972,13 +2008,13 @@ func _event(text: String) -> void:
 
 
 func _roll_grant(side: String) -> Dictionary:
-	var all: Array = Powerups.ids()
 	for attempt in 16:
-		var id: String = all[rng.randi_range(0, all.size() - 1)]
-		var v := Powerups.roll(id, rng)
+		var pk := Powerups.pick(rng, cards[side].size() < Powerups.MAX_CARDS)
+		if pk.is_empty():
+			return {}
+		var id: String = pk["id"]
+		var v: Dictionary = pk["v"]
 		if Powerups.is_card(id):
-			if cards[side].size() >= Powerups.MAX_CARDS:
-				continue
 			return {"t": "grant", "side": side, "id": id, "v": v, "holder": "card"}
 		var types: String = Powerups.DEFS[id]["types"]
 		var pieces: Array = []
@@ -2020,7 +2056,8 @@ func _apply_grant(a: Dictionary) -> void:
 			sqfx[q] = ns
 			where = "as a pickup on %s" % _sq_name(q)
 	pos_version += 1
-	_event("%s got %s %s" % [_side_name(side), Powerups.pu_name(id), where])
+	_event("%s got %s %s %s" % [_side_name(side), Powerups.TIER_NAME[Powerups.tier_of(id, a["v"])].to_lower(),
+			Powerups.pu_name(id), where])
 
 
 # ---------------------------------------------------------------- cards
@@ -2062,7 +2099,7 @@ func _on_card_pressed(side: String, idx: int) -> void:
 				return
 			a["res"] = r
 			_exec(a, true)
-		"board_change":
+		"board_change" when v.get("mode", "") not in ["choose", "pit"]:
 			a["res"] = _roll_holes(v)
 			_exec(a, true)
 		"double_score":
@@ -2086,8 +2123,15 @@ func _on_card_pressed(side: String, idx: int) -> void:
 	_update_cards_ui()
 
 
-func _picks_needed(id: String) -> int:
-	return 2 if id in ["teleport", "gain_taken", "swap", "castle_any", "portal"] else 1
+func _picks_needed(id: String, v: Dictionary = {}) -> int:
+	match id:
+		"teleport", "gain_taken", "swap", "castle_any", "portal":
+			return 2
+		"mine", "freeze":
+			return int(v.get("count", 1))
+		"board_change":
+			return int(v.get("n", 3)) if v.get("mode", "") == "choose" else 1
+	return 1
 
 
 func _target_prompt() -> String:
@@ -2098,8 +2142,11 @@ func _target_prompt() -> String:
 		"gain_taken": ["Choose which captured piece to place", "Choose an empty square"],
 		"swap": ["Choose a piece to swap", "Choose the piece to swap it with"],
 		"castle_any": ["Choose a piece to castle", "Choose a piece it meets on a rank or file"],
+		"board_change": ["Choose an empty square to remove"] if targeting["v"].get("mode", "") == "choose" \
+				else ["Choose an enemy pawn to drop through the board"],
 		"decoy": ["Choose an empty square in your half for the decoy"],
-		"freeze": ["Choose an enemy piece to freeze"],
+		"freeze": ["Choose the centre of the area to freeze"] if targeting["v"].has("area") \
+				else ["Choose an enemy piece to freeze"],
 		"convert": ["Choose an enemy piece to convert"],
 		"wall": ["Choose an empty square for the wall"],
 		"portal": ["Choose the first portal square", "Choose the second portal square"],
@@ -2107,7 +2154,12 @@ func _target_prompt() -> String:
 		"bounty": ["Choose an enemy piece to put a bounty on"],
 		"spin": ["Choose one of your pieces to spin"],
 	}
-	return "%s: %s  (right-click to cancel)" % [Powerups.pu_name(id), prompts[id][step]]
+	var list: Array = prompts[id]
+	var text: String = list[mini(step, list.size() - 1)]
+	var need := _picks_needed(id, targeting["v"])
+	if need > 2 or (need == 2 and list.size() == 1):
+		text += " (%d of %d)" % [step + 1, need]
+	return "%s: %s  (right-click to cancel)" % [Powerups.pu_name(id), text]
 
 
 ## Enemy piece types you've captured that can be placed back as yours (Gain Taken Piece).
@@ -2161,22 +2213,36 @@ func _target_valid(q: int) -> bool:
 				if not own:
 					return false
 				for o in 64:
-					if o != q and board[o] != "" and board[o][0] == side and _meets(q, o) \
+					if o != q and board[o] != "" and (board[o][0] == side or (v.get("enemy", false) and board[o][1] != "K")) \
+							and _meets(q, o) \
 							and _pawn_ok(p, o) and _pawn_ok(board[o], q):
 						return true
 				return false
-			return own and q != picks[0] and _meets(picks[0], q) and _pawn_ok(p, picks[0]) \
+			var ok_piece: bool = own or (v.get("enemy", false) and p != "" and p[1] != "K")
+			return ok_piece and q != picks[0] and _meets(picks[0], q) and _pawn_ok(p, picks[0]) \
 					and _pawn_ok(board[picks[0]], q) and _safe_after_swap(picks[0], q)
 		"decoy":
 			var rank := q >> 3
 			var mine_half := rank <= 3 if side == "w" else rank >= 4
 			return plain and mine_half and _pawn_ok(side + String(v.get("type", "N")), q)
 		"freeze":
-			return enemy and p[1] != "K" and not fx[q].has("frozen")
+			if v.has("area"):
+				return not _freeze_area(q, v).is_empty()
+			return enemy and p[1] != "K" and not fx[q].has("frozen") and not picks.has(q)
 		"convert":
+			# Pawns still on their starting rank can't be converted.
+			var start_rank := 6 if side == "w" else 1
+			if p != "" and p[1] == "P" and (q >> 3) == start_rank:
+				return false
 			return enemy and p[1] != "K" and (v.get("any", false) or p[1] == "P")
-		"wall", "mine":
+		"wall":
 			return plain
+		"mine":
+			return plain and not picks.has(q)
+		"board_change":
+			if v.get("mode", "") == "pit":
+				return enemy and p[1] == "P"
+			return plain and not picks.has(q)
 		"portal":
 			return plain and (step == 0 or q != picks[0])
 		"bounty":
@@ -2237,7 +2303,7 @@ func _on_target_click(d: Vector2i) -> void:
 		if not _target_valid(q):
 			return
 		picks.append(q)
-	if picks.size() < _picks_needed(id):
+	if picks.size() < _picks_needed(id, targeting["v"]):
 		_event(_target_prompt())
 		queue_redraw()
 		return
@@ -2248,6 +2314,9 @@ func _on_target_click(d: Vector2i) -> void:
 			a["res"] = _wall_squares(picks[0], targeting["v"])
 		"spin":
 			a["res"] = _roll_spin(picks[0])
+		"freeze":
+			if targeting["v"].has("area"):
+				a["res"] = _freeze_area(picks[0], targeting["v"])
 	targeting = {}
 	_exec(a, true)
 
@@ -2265,12 +2334,19 @@ func _wall_squares(q: int, v: Dictionary) -> Array:
 
 
 func _roll_spin(q: int) -> String:
-	var outcomes: Array = []
-	for col in ["w", "b"]:
-		for t in ["P", "N", "B", "R", "Q"]:
-			if _pawn_ok(col + t, q):
-				outcomes.append(col + t)
-	return outcomes[rng.randi_range(0, outcomes.size() - 1)]
+	return Powerups.spin_result(rng, turn, _pawn_ok("wP", q) and _pawn_ok("bP", q))
+
+
+## Enemy pieces (not kings, not already frozen) in the square of `area` around q.
+func _freeze_area(q: int, v: Dictionary) -> Array:
+	var res: Array = []
+	var r: int = int(v.get("area", 1))
+	for o in 64:
+		var p: String = board[o]
+		if p != "" and p[0] != turn and p[1] != "K" and not fx[o].has("frozen") \
+				and maxi(absi((o & 7) - (q & 7)), absi((o >> 3) - (q >> 3))) <= r:
+			res.append(o)
+	return res
 
 
 func _roll_holes(v: Dictionary) -> Array:
@@ -2323,8 +2399,15 @@ func _apply_card(a: Dictionary, local: bool) -> void:
 	var id: String = a["id"]
 	var v: Dictionary = a["v"]
 	var picks: Array = a["picks"]
-	if int(a["slot"]) < cards[side].size():
-		cards[side].remove_at(int(a["slot"]))
+	var slot := int(a["slot"])
+	if slot < cards[side].size():
+		var cv: Dictionary = cards[side][slot]["v"]
+		if int(cv.get("uses", 1)) > 1:
+			var nv: Dictionary = cv.duplicate(true)
+			nv["uses"] = int(nv["uses"]) - 1
+			cards[side][slot] = {"id": id, "v": nv}
+		else:
+			cards[side].remove_at(slot)
 	var msg := "%s used %s" % [_side_name(side), Powerups.pu_name(id)]
 	match id:
 		"teleport":
@@ -2346,6 +2429,12 @@ func _apply_card(a: Dictionary, local: bool) -> void:
 			fx[x] = fx[y]
 			board[y] = tp
 			fx[y] = tf
+			if id == "castle_any" and v.has("shield"):
+				for q in [x, y]:
+					if board[q][0] == side and not fx[q].has("ab"):
+						var sf2: Dictionary = fx[q].duplicate(true)
+						sf2["ab"] = {"id": "shield", "v": {"mode": "turns", "n": int(v["shield"])}}
+						fx[q] = sf2
 		"revive":
 			var r: Dictionary = a["res"]
 			board[r["sq"]] = r["p"]
@@ -2362,9 +2451,11 @@ func _apply_card(a: Dictionary, local: bool) -> void:
 			if not _viewer_sees(side):
 				msg = "%s placed a new %s" % [_side_name(side), Powerups.PIECE_NAMES[String(v.get("type", "N"))]]
 		"freeze":
-			var nf: Dictionary = fx[picks[0]].duplicate(true)
-			nf["frozen"] = v["turns"]
-			fx[picks[0]] = nf
+			var targets: Array = a["res"] if v.has("area") else picks
+			for q in targets:
+				var nf: Dictionary = fx[q].duplicate(true)
+				nf["frozen"] = v["turns"]
+				fx[q] = nf
 		"convert":
 			board[picks[0]] = side + board[picks[0]][1]
 			fx[picks[0]] = {}
@@ -2380,14 +2471,28 @@ func _apply_card(a: Dictionary, local: bool) -> void:
 				ns["portal"] = {"pair": picks[1 - i], "turns": v["turns"], "owner": side, "id": portal_count}
 				sqfx[picks[i]] = ns
 		"mine":
-			var ns: Dictionary = sqfx[picks[0]].duplicate(true)
-			ns["mine"] = {"owner": side}
-			sqfx[picks[0]] = ns
+			for q in picks:
+				var ns: Dictionary = sqfx[q].duplicate(true)
+				ns["mine"] = {"owner": side}
+				if v.has("blast"):
+					ns["mine"]["blast"] = int(v["blast"])
+				sqfx[q] = ns
 			if not _viewer_sees(side):
-				msg = "%s hid a mine somewhere..." % _side_name(side)
+				msg = "%s hid %s somewhere..." % [_side_name(side), "a mine" if picks.size() == 1 else "%d mines" % picks.size()]
 		"board_change":
-			for q in a["res"]:
-				sqfx[q] = {"hole": true}
+			match v.get("mode", ""):
+				"choose":
+					for q in picks:
+						sqfx[q] = {"hole": true}
+				"pit":
+					var q: int = picks[0]
+					_record_taken([{"p": board[q], "fx": fx[q], "sq": q}], side)
+					board[q] = ""
+					fx[q] = {}
+					sqfx[q] = {"hole": true}
+				_:
+					for q in a["res"]:
+						sqfx[q] = {"hole": true}
 		"double_score":
 			double_next[side] = true
 		"bounty":
@@ -2474,8 +2579,12 @@ func _update_cards_ui() -> void:
 			st.set_corner_radius_all(3)
 			if i < cards[c].size():
 				var card: Dictionary = cards[c][i]
-				btn.text = Powerups.pu_name(card["id"])
+				var cu: int = int(card["v"].get("uses", 1))
+				btn.text = Powerups.pu_name(card["id"]) + (" x%d" % cu if cu > 1 else "")
 				st.border_color = Powerups.color(card["id"])
+				var tc: Color = Powerups.TIER_COLOR[Powerups.tier_of(card["id"], card["v"])]
+				btn.add_theme_color_override("font_color", tc)
+				btn.add_theme_color_override("font_disabled_color", Color(tc, 0.55))
 				if targeting.get("slot", -1) == i and c == turn:
 					st.bg_color = Color(Powerups.color(card["id"]), 0.45)
 				btn.disabled = blocked != ""
@@ -2491,8 +2600,9 @@ func _update_cards_ui() -> void:
 				st.border_color = BORDER_COL
 			for k in ["normal", "hover", "pressed", "disabled"]:
 				btn.add_theme_stylebox_override(k, st)
-			btn.add_theme_color_override("font_disabled_color", Color(LIGHT_COL, 0.55))
-			btn.add_theme_color_override("font_color", LIGHT_COL)
+			if not btn.has_theme_color_override("font_color"):
+				btn.add_theme_color_override("font_disabled_color", Color(LIGHT_COL, 0.55))
+				btn.add_theme_color_override("font_color", LIGHT_COL)
 			btn.add_theme_color_override("font_hover_color", Color.WHITE)
 			box.add_child(btn)
 		box.reset_size()
@@ -2666,6 +2776,11 @@ func _draw_targeting() -> void:
 
 ## The current position as FEN, so Stockfish can judge whatever the powerups have done.
 func _fen() -> String:
+	return _fen_with({})
+
+
+## letters: square -> piece letter (lowercase) to use instead of the normal one (Fairy custom pieces).
+func _fen_with(letters: Dictionary) -> String:
 	var rows: Array = []
 	for r in range(7, -1, -1):
 		var row := ""
@@ -2678,18 +2793,19 @@ func _fen() -> String:
 			if empty > 0:
 				row += str(empty)
 				empty = 0
-			row += p[1] if p[0] == "w" else p[1].to_lower()
+			var ch: String = letters.get(r * 8 + fl, p[1].to_lower())
+			row += ch.to_upper() if p[0] == "w" else ch
 		if empty > 0:
 			row += str(empty)
 		rows.append(row)
 	var cs := ""
-	if castling["wK"]:
+	if castling["wK"] and not letters.has(7):
 		cs += "K"
-	if castling["wQ"]:
+	if castling["wQ"] and not letters.has(0):
 		cs += "Q"
-	if castling["bK"]:
+	if castling["bK"] and not letters.has(63):
 		cs += "k"
-	if castling["bQ"]:
+	if castling["bQ"] and not letters.has(56):
 		cs += "q"
 	var ep := "-"
 	if ep_square != -1:
@@ -2742,3 +2858,119 @@ func _fallback_move() -> Dictionary:
 	if best_val < 0 and not all.is_empty():
 		best = all[rng.randi_range(0, all.size() - 1)]
 	return best
+
+
+# ---------------------------------------------------------------- fairy-stockfish rules
+#
+# Before each search the current powerup rules are written as a Fairy-Stockfish variant:
+# pieces with movement abilities become custom piece types, frozen pieces become immobile, and
+# walls/holes become squares nothing may move to. Things its rules format can't express (mines,
+# portals, shields, explosions, decoys, extra moves, ranged captures) stay invisible to it; the
+# game still only lets it play moves that are legal here (searchmoves).
+
+const FSF_LETTERS := "acdefghijlmostuvwxyz"   # spare letters for custom pieces
+const FSF_BASE := {"P": "mfWcfFifmnD", "N": "N", "B": "B", "R": "R", "Q": "Q"}
+const FSF_VALUE := {"P": [126, 208], "N": [781, 854], "B": [825, 915], "R": [1276, 1380], "Q": [2538, 2682]}
+const FSF_TYPES := ["Pawn", "Knight", "Bishop", "Rook", "Queen", "King"]
+const FSF_INI := "user://engine/powerchess.ini"
+var fsf_count := 0
+var fsf_last_body := ""
+var fsf_last_name := "chess"
+
+
+## The rules Fairy-Stockfish needs for this position: {"body": variant settings ("" = plain
+## chess), "fen": position using the custom piece letters}.
+func _fsf_position() -> Dictionary:
+	var letters := {}
+	var customs := {}
+	var defs: Array = []
+	for q in 64:
+		var p: String = board[q]
+		if p == "" or p[1] == "K":
+			continue
+		var e: Dictionary = fx[q]
+		var betza := ""
+		var bonus := 0
+		if e.has("frozen"):
+			betza = ""  # immobile
+		else:
+			var ab: Dictionary = e.get("ab", {})
+			match ab.get("id", ""):
+				"knight_hop":
+					betza = FSF_BASE[p[1]] + "N"
+					bonus = 250
+				"copy_move":
+					betza = FSF_BASE[p[1]] + "QN"
+					bonus = 800
+				"jump":
+					betza = FSF_BASE[p[1]] + ("pR" if p[1] != "B" else "") + ("pB" if p[1] != "R" else "")
+					bonus = 200
+				"backstep":
+					betza = FSF_BASE["P"] + "mbR%d" % int(ab["v"]["back"]) + "mfR%d" % int(ab["v"]["fwd"])
+					bonus = 60
+				_:
+					continue
+		var mg: int = FSF_VALUE[p[1]][0] + bonus
+		var eg: int = FSF_VALUE[p[1]][1] + bonus
+		var key := "%s|%d|%d" % [betza, mg, eg]
+		if not customs.has(key):
+			if customs.size() >= FSF_LETTERS.length():
+				continue
+			customs[key] = FSF_LETTERS[customs.size()]
+			defs.append([customs[key], betza, mg, eg])
+		letters[q] = customs[key]
+	var blocked: Array = []
+	for q in 64:
+		if _blocked(sqfx, q):
+			blocked.append(q)
+	var fen := _fen_with(letters)
+	if defs.is_empty() and blocked.is_empty():
+		return {"body": "", "fen": fen}
+	var lines: Array = []
+	var mg_parts: Array = []
+	var eg_parts: Array = []
+	for i in defs.size():
+		var d: Array = defs[i]
+		lines.append("customPiece%d = %s:%s" % [i + 1, d[0], d[1]])
+		mg_parts.append("%s:%d" % [d[0], d[2]])
+		eg_parts.append("%s:%d" % [d[0], d[3]])
+	if not defs.is_empty():
+		lines.append("pieceValueMg = " + " ".join(mg_parts))
+		lines.append("pieceValueEg = " + " ".join(eg_parts))
+	if not blocked.is_empty():
+		var allowed: Array = []
+		for q in 64:
+			if not blocked.has(q):
+				allowed.append(_sq_name(q))
+		var region := " ".join(allowed)
+		var names: Array = FSF_TYPES.duplicate()
+		for i in defs.size():
+			names.append("CustomPiece%d" % (i + 1))
+		for col in ["White", "Black"]:
+			for n in names:
+				lines.append("mobilityRegion%s%s = %s" % [col, n, region])
+	return {"body": "\n".join(lines) + "\n", "fen": fen}
+
+
+## Loads this position's rules into Fairy-Stockfish (when they changed) and returns the FEN to send.
+func _fsf_prepare() -> String:
+	if engine == null or not engine.is_fairy:
+		return _fen()
+	var pos := _fsf_position()
+	var body: String = pos["body"]
+	if body == "":
+		engine.set_variant("", "chess")
+	elif body == fsf_last_body and fsf_last_name != "chess":
+		engine.set_variant("", fsf_last_name)
+	else:
+		# A variant name can only be defined once per engine run, so every new rule set gets a new name.
+		fsf_count += 1
+		var name := "powerchess%d" % fsf_count
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://engine"))
+		var f := FileAccess.open(FSF_INI, FileAccess.WRITE)
+		f.store_string("[%s:chess]\n%s" % [name, body])
+		f.close()
+		engine.set_variant(ProjectSettings.globalize_path(FSF_INI), name)
+		fsf_last_body = body
+		fsf_last_name = name
+	return pos["fen"]
